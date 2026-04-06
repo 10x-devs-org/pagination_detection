@@ -9,6 +9,19 @@ wheels/
 # Virtual environments
 .venv
 
+wayfair 
+
+
 results.json
 
 urls.txt    
+statistics.json
+
+GR_ursl.txt
+ooo.json    
+output.json 
+urls2.txt 
+
+demo.py 
+*.html
+*.log
