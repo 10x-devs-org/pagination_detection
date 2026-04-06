@@ -3,14 +3,12 @@ pagination_detector.py
 ======================
 Detects pagination on any MRP (Multiple Record Page) URL.
 
-Strategy:
-  1. Try plain requests (with curl_cffi TLS impersonation if available).
-  2. Detect hard blocks: Cloudflare, PerimeterX, 403/429/503.
-  3. If blocked -> deep interaction bypass (stealth + human behavior simulation).
-  4. If stealth succeeds but no pagination -> scroll simulation + wait for selectors.
-  5. CAPTCHA solving via 2captcha (reCAPTCHA, hCaptcha, Turnstile, PerimeterX).
-  6. For SPA pages, intercept XHR/fetch to find API-level pagination.
-  7. Return structured JSON result.
+Changelog (latest fixes):
+  - Newegg Monitors null max_page: added X/Y slash pattern (e.g. "1/15") + data-page attr scan
+  - Etsy pagination not found: added deep bottom-scroll retry + total-results count estimation
+  - Newegg pagination_key "path_segment" → actual keyword e.g. "page"
+  - Newegg load-more false positive (FAQ buttons) → excluded by keyword filter
+  - Amazon IntersectionObserver false infinite-scroll → weak-signal guard added
 
 Install:
   pip install playwright playwright-stealth requests beautifulsoup4 curl_cffi 2captcha-python
@@ -35,6 +33,7 @@ import os
 import random
 import re
 import sys
+import time
 from urllib.parse import urlparse, parse_qs
 
 from bs4 import BeautifulSoup
@@ -86,7 +85,7 @@ HEADERS = {
         "q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8"
     ),
     "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
+    "Accept-Encoding": "gzip, deflate",
     "Connection": "keep-alive",
     "Upgrade-Insecure-Requests": "1",
     "Sec-Fetch-Dest": "document",
@@ -132,15 +131,31 @@ PAGINATION_PARAM_NAMES = [
 ]
 
 PAGINATION_SELECTORS = [
+    # Standard
     ".pagination", ".pager", ".paginator",
     "[aria-label*='pagination']", "[aria-label*='Pagination']",
+    "[aria-label*='Page navigation']", "[aria-label*='page navigation']",
     "nav ul", ".page-numbers", ".pages",
+    # Class fragments
     "[class*='paginat']", "[class*='pageNav']",
-    "[class*='page-nav']", "[id*='pagination']",
+    "[class*='page-nav']", "[class*='Pagination']",
+    "[id*='pagination']",
+    # Data attributes — Etsy, React/Vue apps
     "[data-testid*='pagination']", "[data-testid*='paging']",
+    "[data-wt-pagination]", "[data-pagination]",
+    "[data-page-number]",
+    # Newegg / e-commerce specific
+    "[class*='list-tool-page']", "[class*='tool-page']",
+    # Scroll / load-more containers (scanned separately but included for href scan)
     ".infinite-scroll-component", "[data-infinite-scroll]",
     ".load-more", "[class*='loadMore']", "[class*='load-more']",
     "button[data-page]", "[class*='ShowMore']",
+]
+
+LOAD_MORE_EXCLUSION_KEYWORDS = [
+    "faq", "review", "question", "answer", "comment",
+    "description", "spec", "detail", "article", "blog",
+    "guide", "help", "support",
 ]
 
 LOAD_MORE_SELECTORS = [
@@ -150,24 +165,38 @@ LOAD_MORE_SELECTORS = [
     "button[class*='More']",
 ]
 
-INFINITE_SCROLL_SIGNALS = [
-    "IntersectionObserver", "infinite-scroll", "data-infinite",
-    "infiniteScroll", "infinite_scroll", "loadMore",
+NON_PRODUCT_CONTAINERS = [
+    ".faq", "[class*='faq']", "[id*='faq']",
+    ".review", "[class*='review']",
+    ".qa", "[class*='questions']",
+    "footer", ".footer",
+    ".sidebar", "[class*='sidebar']",
 ]
+
+INFINITE_SCROLL_STRONG_SIGNALS = {
+    "infinite-scroll", "data-infinite", "infiniteScroll",
+    "infinite_scroll", "react-infinite",
+}
+
+INFINITE_SCROLL_WEAK_SIGNALS = {
+    "IntersectionObserver", "loadMore",
+}
 
 POST_SCROLL_WAIT_SELECTORS = [
     ".pagination", "[aria-label*='pagination']",
-    "[data-testid*='pagination']", ".pager",
-    "[class*='paginat']", ".load-more",
-    "[class*='loadMore']", "nav ul li a",
+    "[data-testid*='pagination']", "[data-wt-pagination]",
+    ".pager", "[class*='paginat']",
+    ".load-more", "[class*='loadMore']",
+    "nav ul li a",
 ]
 
-# PerimeterX human-behavior init script injected before page load
+# Etsy/SPA default items per page for total-count estimation
+DEFAULT_ITEMS_PER_PAGE = 48
+
 PX_INIT_SCRIPT = """
     Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
     Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
     Object.defineProperty(navigator, 'languages', {get: () => ['en-US','en']});
-
     const origToDataURL = HTMLCanvasElement.prototype.toDataURL;
     HTMLCanvasElement.prototype.toDataURL = function(type) {
         const ctx = this.getContext('2d');
@@ -178,7 +207,6 @@ PX_INIT_SCRIPT = """
         }
         return origToDataURL.call(this, type);
     };
-
     window._mouseHistory = [];
     for (let i = 0; i < 10; i++) {
         window._mouseHistory.push({
@@ -207,8 +235,8 @@ def detect_block(status_code, headers, body):
         if any(s in body_lower for s in PERIMETERX_SIGNALS):
             return True, "perimeterx"
         return True, "hard_block"
-    if headers.get("cf-ray") or headers.get("CF-RAY"):
-        return True, "cloudflare"
+    #if headers.get("cf-ray") or headers.get("CF-RAY"):
+    #    return True, "cloudflare"
     if any(s in body_lower for s in PERIMETERX_SIGNALS):
         return True, "perimeterx"
     if "just a moment" in body_lower or "checking your browser" in body_lower:
@@ -217,7 +245,6 @@ def detect_block(status_code, headers, body):
 
 
 def detect_captcha(body):
-    """Return (found, type, sitekey_or_appid)."""
     if not body:
         return False, None, None
     b = body.lower()
@@ -239,8 +266,7 @@ def detect_captcha(body):
 def _is_still_blocked(body):
     if not body:
         return True
-    b = body.lower()
-    return any(sig in b for sig in BLOCK_BODY_SIGNALS)
+    return any(sig in body.lower() for sig in BLOCK_BODY_SIGNALS)
 
 
 def is_js_rendered(body):
@@ -279,7 +305,6 @@ async def solve_captcha_on_page(page, url, captcha_type, sitekey, api_key):
             return False
 
         print("  [CAPTCHA] Injecting token...", file=sys.stderr)
-
         if captcha_type == "perimeterx":
             await page.evaluate(f"""
                 window._pxParam1 = '{token}';
@@ -320,12 +345,12 @@ async def solve_captcha_on_page(page, url, captcha_type, sitekey, api_key):
 
 
 # ---------------------------------------------------------------------------
-# PAGINATION PARSING
+# PAGINATION PARSING HELPERS
 # ---------------------------------------------------------------------------
 
 def _ints(text):
-    return [int(n.replace(",","")) for n in re.findall(r"[\d,]+", text)
-            if n.replace(",","").isdigit()]
+    return [int(n.replace(",", "")) for n in re.findall(r"[\d,]+", text)
+            if n.replace(",", "").isdigit()]
 
 
 def _param_from_href(href):
@@ -340,66 +365,191 @@ def _param_from_href(href):
 
 
 def _path_page(href):
+    """
+    Detect path-segment pagination.
+    Returns (keyword, page_number) e.g. ("page", 2) — NOT the generic "path_segment".
+    """
     path = urlparse(href).path
     for pat in [r"/(page|p|pg)/(\d+)", r"/(page|p|pg)-(\d+)(?:\.html?)?"]:
         m = re.search(pat, path, re.I)
         if m:
-            return "path_segment", int(m.group(2))
+            return m.group(1).lower(), int(m.group(2))
     m = re.match(r"^(page|p|pg)-(\d+)(?:\.html?)?$",
                  href.split("?")[0].split("/")[-1], re.I)
     if m:
-        return "path_segment", int(m.group(2))
+        return m.group(1).lower(), int(m.group(2))
     return None, None
 
 
 def _detect_infinite_scroll(soup, raw):
-    for sig in INFINITE_SCROLL_SIGNALS:
-        if sig in raw:
-            return True
-    for sel in ["[data-infinite-scroll]","[infinite-scroll]",".infinite-scroll-component"]:
+    for sel in ["[data-infinite-scroll]", "[infinite-scroll]",
+                ".infinite-scroll-component", "[data-testid='infinite-scroll']"]:
         if soup.select(sel):
             return True
+    strong_found = any(sig in raw for sig in INFINITE_SCROLL_STRONG_SIGNALS)
+    weak_found = any(sig in raw for sig in INFINITE_SCROLL_WEAK_SIGNALS)
+    if strong_found:
+        return True
+    if weak_found:
+        for sel in PAGINATION_SELECTORS:
+            try:
+                if soup.select(sel):
+                    return False
+            except Exception:
+                pass
+        for a in soup.find_all("a", href=True):
+            if _param_from_href(a["href"]) or _path_page(a["href"])[0]:
+                return False
+        return True
+    return False
+
+
+def _element_in_non_product_container(el, soup):
+    for sel in NON_PRODUCT_CONTAINERS:
+        try:
+            for container in soup.select(sel):
+                if el in container.descendants:
+                    return True
+        except Exception:
+            pass
     return False
 
 
 def _detect_load_more(soup):
     for sel in LOAD_MORE_SELECTORS:
-        els = soup.select(sel)
-        if els:
-            el = els[0]
-            return {"found": True, "text": el.get_text(strip=True),
-                    "data_page": el.get("data-page"), "onclick": el.get("onclick")}
+        try:
+            for el in soup.select(sel):
+                text = el.get_text(strip=True)
+                if any(kw in text.lower() for kw in LOAD_MORE_EXCLUSION_KEYWORDS):
+                    continue
+                if _element_in_non_product_container(el, soup):
+                    continue
+                return {"found": True, "text": text,
+                        "data_page": el.get("data-page"), "onclick": el.get("onclick")}
+        except Exception:
+            continue
     return {"found": False}
 
 
-def parse_pagination(soup, base_url, raw_html=""):
-    r = {"pagination_found": False, "pagination_type": "none",
-         "pagination_key": None, "max_page": None, "notes": ""}
+# ---------------------------------------------------------------------------
+# [FIX] MAX PAGE HELPERS
+# ---------------------------------------------------------------------------
 
-    # Infinite scroll
+def _max_page_from_data_attrs(soup):
+    """
+    Extract max page from data-page attributes anywhere on the page.
+    Catches Newegg-style JS pagination where links use href="#" data-page="N".
+    """
+    nums = []
+    for el in soup.find_all(attrs={"data-page": True}):
+        try:
+            v = int(el["data-page"])
+            if 1 < v <= 9999:
+                nums.append(v)
+        except (ValueError, TypeError):
+            pass
+    return max(nums) if nums else None
+
+
+def _max_page_from_slash_pattern(text):
+    """
+    Extract max page from 'X/Y' patterns like '1/15' or 'Page 1/20'.
+    Used by Newegg and many e-commerce sites that show current/total pages.
+    """
+    m = re.search(r'\b(\d+)\s*/\s*(\d+)\b', text)
+    if m:
+        total = int(m.group(2))
+        if 1 < total <= 9999:
+            return total
+    return None
+
+
+def _max_page_from_total_count(soup):
+    """
+    Estimate max_page from total result count text.
+    Handles:
+      '1-48 of 50,000 results'    -> ceil(50000 / 48) = 1042
+      '50,000+ results'           -> ceil(50000 / 48) = 1042  (assumes 48/page)
+      'About 48,000 results'      -> ceil(48000 / 48) = 1000
+    Used as a fallback when no explicit pagination links are found (e.g. Etsy).
+    """
+    text = soup.get_text(" ", strip=True)
+
+    # Pattern 1: "X-Y of Z results" — per_page is derived from range
+    m = re.search(
+        r'(\d[\d,]*)\s*[-–]\s*(\d[\d,]*)\s+of\s+([\d,]+)\+?\s+results?',
+        text, re.I
+    )
+    if m:
+        try:
+            x = int(m.group(1).replace(",", ""))
+            y = int(m.group(2).replace(",", ""))
+            z = int(m.group(3).replace(",", ""))
+            per_page = y - x + 1
+            if per_page > 0 and z > 0:
+                return math.ceil(z / per_page), per_page, z
+        except Exception:
+            pass
+
+    # Pattern 2: standalone "N results" or "N+ results" — assume default per_page
+    m = re.search(r'\b([\d,]+)\+?\s+results?\b', text, re.I)
+    if m:
+        try:
+            z = int(m.group(1).replace(",", ""))
+            if z > 0:
+                return math.ceil(z / DEFAULT_ITEMS_PER_PAGE), DEFAULT_ITEMS_PER_PAGE, z
+        except Exception:
+            pass
+
+    return None, None, None
+
+
+# ---------------------------------------------------------------------------
+# MAIN PAGINATION PARSER
+# ---------------------------------------------------------------------------
+
+def parse_pagination(soup, base_url, raw_html=""):
+    r = {
+        "pagination_found": False,
+        "pagination_type": "none",
+        "pagination_key": None,
+        "max_page": None,
+        "notes": "",
+    }
+
+    # ── Infinite scroll ───────────────────────────────────────────────────
     if _detect_infinite_scroll(soup, raw_html):
-        r.update({"pagination_found": True, "pagination_type": "infinite_scroll",
-                  "notes": "Infinite scroll — max_page undeterminable"})
+        max_p, per_p, total = _max_page_from_total_count(soup)
+        r.update({
+            "pagination_found": True,
+            "pagination_type": "infinite_scroll",
+            "max_page": max_p,
+            "notes": (
+                f"Infinite scroll — estimated {max_p} pages "
+                f"({total} results / {per_p} per page)"
+                if max_p else "Infinite scroll — max_page undeterminable"
+            ),
+        })
         return r
 
-    # Load More
+    # ── Load More (product-only after exclusion) ──────────────────────────
     lm = _detect_load_more(soup)
     if lm["found"]:
-        r.update({"pagination_found": True, "pagination_type": "load_more",
-                  "pagination_key": "js_trigger",
-                  "notes": f"Load More button: '{lm['text']}'"})
-        m = re.search(r"[Ss]howing\s+([\d,]+)\s*[-–]\s*([\d,]+)\s+of\s+([\d,]+)",
-                      soup.get_text(" ", strip=True))
-        if m:
-            try:
-                x,y,z = (int(m.group(i).replace(",","")) for i in (1,2,3))
-                if (y-x+1) > 0:
-                    r["max_page"] = math.ceil(z/(y-x+1))
-            except Exception:
-                pass
+        max_p, per_p, total = _max_page_from_total_count(soup)
+        r.update({
+            "pagination_found": True,
+            "pagination_type": "load_more",
+            "pagination_key": "js_trigger",
+            "max_page": max_p,
+            "notes": (
+                f"Load More button: '{lm['text']}'"
+                + (f" — estimated {max_p} pages ({total} results / {per_p} per page)"
+                   if max_p else "")
+            ),
+        })
         return r
 
-    # Link / JS pagination
+    # ── Link / JS pagination ──────────────────────────────────────────────
     keys_seen, has_js = [], False
     container_hrefs = set()
 
@@ -412,22 +562,27 @@ def parse_pagination(soup, base_url, raw_html=""):
             pass
 
     anchors = soup.find_all("a", href=True)
+
     for a in anchors:
         href = a["href"]
         in_c = href in container_hrefs
         k = _param_from_href(href)
         if k:
-            keys_seen.append(k); r["pagination_found"] = True
-        ps, pn = _path_page(href)
-        if ps and pn and (in_c or re.search(r"/(page|p|pg)[-/]", href, re.I)):
-            keys_seen.append(ps); r["pagination_found"] = True
+            keys_seen.append(k)
+            r["pagination_found"] = True
+        ps_key, ps_num = _path_page(href)
+        if ps_key and ps_num and (in_c or re.search(r"/(page|p|pg)[-/]", href, re.I)):
+            keys_seen.append(ps_key)
+            r["pagination_found"] = True
 
     js_els = soup.find_all(lambda t:
         t.has_attr("data-page") or t.has_attr("data-href") or t.has_attr("data-value")
         or (t.has_attr("onclick") and "page" in t["onclick"].lower())
-        or (t.has_attr("href") and t["href"].startswith("#")))
+        or (t.has_attr("href") and t["href"].startswith("#"))
+    )
     if js_els:
-        has_js = True; r["pagination_found"] = True
+        has_js = True
+        r["pagination_found"] = True
 
     for sel in PAGINATION_SELECTORS:
         try:
@@ -436,88 +591,182 @@ def parse_pagination(soup, base_url, raw_html=""):
                     k = _param_from_href(a["href"])
                     if not k:
                         pk, _ = _path_page(a["href"])
-                        if pk: k = pk
+                        if pk:
+                            k = pk
                     if k:
-                        keys_seen.append(k); r["pagination_found"] = True
+                        keys_seen.append(k)
+                        r["pagination_found"] = True
                 if [n for n in _ints(c.get_text()) if n > 1]:
                     r["pagination_found"] = True
         except Exception:
             pass
 
+    # Broad fallback scan — catches Etsy and sites with pagination
+    # links outside standard container selectors
+    if not r["pagination_found"]:
+        for a in anchors:
+            href = a["href"]
+            k = _param_from_href(href)
+            if k:
+                try:
+                    val = parse_qs(urlparse(href).query).get(k, [None])[0]
+                    if val and int(val) >= 2:
+                        keys_seen.append(k)
+                        r["pagination_found"] = True
+                except Exception:
+                    pass
+            ps_key, ps_num = _path_page(href)
+            if ps_key and ps_num and ps_num >= 2:
+                keys_seen.append(ps_key)
+                r["pagination_found"] = True
+        if r["pagination_found"]:
+            r["notes"] = "Detected via broad fallback anchor scan"
+
+    # Classify type and key
     if r["pagination_found"]:
-        if keys_seen and not has_js:    r["pagination_type"] = "link"
-        elif has_js and not keys_seen:  r["pagination_type"] = "js_redirect"
-        else:                           r["pagination_type"] = "link"
+        if keys_seen and not has_js:
+            r["pagination_type"] = "link"
+        elif has_js and not keys_seen:
+            r["pagination_type"] = "js_redirect"
+        else:
+            r["pagination_type"] = "link"
 
     if keys_seen:
         r["pagination_key"] = max(set(keys_seen), key=keys_seen.count)
     elif r["pagination_found"] and has_js:
         r["pagination_key"] = "js_trigger"
 
-    # Max page
+    # ── Max page — 6-priority logic ───────────────────────────────────────
     pt = r["pagination_type"]
-    if pt in ("api","none"):
+    if pt in ("api", "none"):
+        # Even if no pagination found, try to estimate from total count
+        # (useful for Etsy where pagination links don't render in headless)
+        max_p, per_p, total = _max_page_from_total_count(soup)
+        if max_p:
+            r.update({
+                "pagination_found": True,
+                "pagination_type": "estimated",
+                "pagination_key": "page",
+                "max_page": max_p,
+                "notes": (
+                    f"No pagination links found — estimated {max_p} pages "
+                    f"from total count ({total} results / {per_p} per page)"
+                ),
+            })
         return r
 
     ft = soup.get_text(" ", strip=True)
 
-    # P1: Last link
+    # P1: Explicit Last link
     for a in anchors:
         tl = a.get_text(strip=True).lower()
-        if tl in ("last","last »","»","last page","›",">>"):
+        if tl in ("last", "last »", "»", "last page", "›", ">>"):
             href = a["href"]
             k = _param_from_href(href)
             if k:
-                ns = _ints(" ".join(parse_qs(urlparse(href).query).get(k,[])))
-                if ns: r["max_page"] = max(ns); return r
+                ns = _ints(" ".join(parse_qs(urlparse(href).query).get(k, [])))
+                if ns:
+                    r["max_page"] = max(ns)
+                    return r
             pk, pn = _path_page(href)
-            if pk and pn: r["max_page"] = pn; return r
+            if pk and pn:
+                r["max_page"] = pn
+                return r
 
-    # P2: Highest in container
+    # P2: Highest integer in pagination container
     cpn, hpn = [], []
     for sel in PAGINATION_SELECTORS:
         try:
             for c in soup.select(sel):
-                for el in c.find_all(["a","span","li","button"]):
+                for el in c.find_all(["a", "span", "li", "button"]):
                     t = el.get_text(strip=True)
                     if t.isdigit() and 1 < int(t) <= 9999:
                         cpn.append(int(t))
                 for a in c.find_all("a", href=True):
                     k = _param_from_href(a["href"])
                     if k:
-                        hpn.extend(_ints(" ".join(parse_qs(urlparse(a["href"]).query).get(k,[]))))
+                        hpn.extend(_ints(" ".join(
+                            parse_qs(urlparse(a["href"]).query).get(k, [])
+                        )))
                     _, pn = _path_page(a["href"])
-                    if pn: hpn.append(pn)
+                    if pn:
+                        hpn.append(pn)
         except Exception:
             pass
+
+    # Also collect from broad fallback anchors if container scan found nothing
+    if not cpn:
+        for a in anchors:
+            k = _param_from_href(a["href"])
+            if k:
+                try:
+                    vals = _ints(" ".join(parse_qs(urlparse(a["href"]).query).get(k, [])))
+                    cpn.extend(vals)
+                    hpn.extend(vals)
+                except Exception:
+                    pass
+            _, pn = _path_page(a["href"])
+            if pn:
+                cpn.append(pn)
+                hpn.append(pn)
 
     if cpn:
         hi = max(cpn)
         ml = max(hpn) if hpn else hi
-        if not (hi > 10*ml and hi > 9999) and hi > 1:
-            r["max_page"] = hi; return r
+        if not (hi > 10 * ml and hi > 9999) and hi > 1:
+            r["max_page"] = hi
+            return r
 
-    # P3: Page X of Y
+    # P3: "Page X of Y" or "X of Y pages"
     m = re.search(r"[Pp]age\s+\d+\s+of\s+(\d+)", ft)
     if not m:
         m = re.search(r"\d+\s+of\s+(\d+)\s+pages?", ft)
     if m:
-        v = int(m.group(1).replace(",",""))
-        if 1 < v <= 9999: r["max_page"] = v; return r
+        v = int(m.group(1).replace(",", ""))
+        if 1 < v <= 9999:
+            r["max_page"] = v
+            return r
 
-    # P4: Showing X-Y of Z
+    # P3b: [FIX] "X/Y" slash format — e.g. Newegg "1/15"
+    slash_max = _max_page_from_slash_pattern(ft)
+    if slash_max:
+        r["max_page"] = slash_max
+        return r
+
+    # P4: "Showing X–Y of Z results"
     m = re.search(r"[Ss]howing\s+([\d,]+)\s*[-–]\s*([\d,]+)\s+of\s+([\d,]+)", ft)
     if m:
         try:
-            x,y,z = (int(m.group(i).replace(",","")) for i in (1,2,3))
-            ps = y-x+1
-            if ps > 0 and z > 0: r["max_page"] = math.ceil(z/ps); return r
+            x, y, z = (int(m.group(i).replace(",", "")) for i in (1, 2, 3))
+            ps = y - x + 1
+            if ps > 0 and z > 0:
+                r["max_page"] = math.ceil(z / ps)
+                return r
         except Exception:
             pass
 
-    # P5
-    if pt in ("link","js_redirect"):
-        r["notes"] = (r["notes"]+" | max_page undetermined — forward crawl required.").strip(" | ")
+    # P4b: [FIX] data-page attribute scan — covers JS-paginated sites
+    # where links use href="#" + data-page="N" (Newegg Monitors style)
+    dp_max = _max_page_from_data_attrs(soup)
+    if dp_max:
+        r["max_page"] = dp_max
+        return r
+
+    # P5: Total count estimation — fallback when no numbered links visible
+    max_p, per_p, total = _max_page_from_total_count(soup)
+    if max_p:
+        r["max_page"] = max_p
+        r["notes"] = (
+            (r["notes"] + " | " if r["notes"] else "")
+            + f"max_page estimated from total count ({total} results / {per_p} per page)"
+        )
+        return r
+
+    # P6: prev/next only
+    if pt in ("link", "js_redirect"):
+        r["notes"] = (
+            r["notes"] + " | max_page undetermined — forward crawl required."
+        ).strip(" | ")
 
     return r
 
@@ -543,7 +792,17 @@ def fetch_with_requests(url):
         return {
             "status_code": resp.status_code, "blocked": False, "block_type": None,
             "body": body, "fetch_method": "requests",
-            "needs_playwright": is_js_rendered(body) or len(resp.text.strip()) < 2000,
+            "needs_playwright": (
+                is_js_rendered(body)
+                or len(resp.text.strip()) < 2000
+                or (len(resp.text.strip()) < 100_000 and not any(
+                    sig in body for sig in [
+                        "data-component-type", "s-result-item",
+                        "class=\"product", "class='product",
+                        "data-testid=\"product",
+                    ]
+                ))
+            ),
         }
     except Exception as e:
         return {"status_code": None, "blocked": False, "block_type": None,
@@ -552,7 +811,6 @@ def fetch_with_requests(url):
 
 # ---------------------------------------------------------------------------
 # DEEP INTERACTION FETCH
-# Stealth + PerimeterX human simulation + CAPTCHA solving + scroll + intercept
 # ---------------------------------------------------------------------------
 
 async def fetch_with_deep_interaction(url, captcha_api_key=None, proxy=None, debug=False):
@@ -582,23 +840,22 @@ async def fetch_with_deep_interaction(url, captcha_api_key=None, proxy=None, deb
                     timezone_id=STEALTH_CONTEXT["timezone_id"],
                     viewport=STEALTH_CONTEXT["viewport"],
                     java_script_enabled=True, bypass_csp=True,
-                    extra_http_headers={k:v for k,v in HEADERS.items() if k!="User-Agent"},
+                    extra_http_headers={k: v for k, v in HEADERS.items() if k != "User-Agent"},
                 )
                 page = await ctx.new_page()
 
                 if STEALTH_AVAILABLE:
                     await stealth_async(page)
 
-                # Inject PerimeterX behavior simulation script
                 await page.add_init_script(PX_INIT_SCRIPT)
 
-                # Intercept all network requests
                 async def on_req(req):
                     u = req.url
                     all_reqs.append(u)
                     for p2 in PAGINATION_PARAM_NAMES:
                         if p2 in parse_qs(urlparse(u).query):
-                            pag_reqs.append(u); break
+                            pag_reqs.append(u)
+                            break
                 page.on("request", on_req)
 
                 # Initial load
@@ -616,16 +873,16 @@ async def fetch_with_deep_interaction(url, captcha_api_key=None, proxy=None, deb
 
                 body = await page.content()
 
-                # Mouse movement before CAPTCHA check (PX needs movement events)
+                # Mouse movement (PerimeterX signal)
                 try:
-                    await page.mouse.move(random.randint(100,600), random.randint(100,400))
+                    await page.mouse.move(random.randint(100, 600), random.randint(100, 400))
                     await asyncio.sleep(random.uniform(0.2, 0.5))
-                    await page.mouse.move(random.randint(200,800), random.randint(200,500))
+                    await page.mouse.move(random.randint(200, 800), random.randint(200, 500))
                     await asyncio.sleep(random.uniform(0.1, 0.3))
                 except Exception:
                     pass
 
-                # CAPTCHA detection and solving
+                # CAPTCHA check
                 cap_found, cap_type, sitekey = detect_captcha(body)
                 if cap_found:
                     print(f"  [CAPTCHA] {cap_type} detected.", file=sys.stderr)
@@ -635,10 +892,9 @@ async def fetch_with_deep_interaction(url, captcha_api_key=None, proxy=None, deb
                         if captcha_solved:
                             body = await page.content()
                     else:
-                        print("  [CAPTCHA] No key — pass --captcha-key to auto-solve.", file=sys.stderr)
+                        print("  [CAPTCHA] No key — pass --captcha-key.", file=sys.stderr)
 
-                # Human-like scroll simulation
-                # Randomized steps/delays = human pattern (uniform = bot signal for PX)
+                # Human-like scroll
                 print("  [SCROLL] Human-like scroll...", file=sys.stderr)
                 try:
                     ph = await page.evaluate("document.body.scrollHeight")
@@ -648,7 +904,7 @@ async def fetch_with_deep_interaction(url, captcha_api_key=None, proxy=None, deb
                         pos = min(pos + step, ph)
                         await page.evaluate(f"window.scrollTo(0, {pos})")
                         await asyncio.sleep(random.uniform(0.3, 0.9))
-                    await asyncio.sleep(random.uniform(1.0, 2.0))   # human pause at bottom
+                    await asyncio.sleep(random.uniform(1.0, 2.0))
                     await page.evaluate("window.scrollTo(0, document.body.scrollHeight - 800)")
                     await asyncio.sleep(random.uniform(0.8, 1.5))
                     try:
@@ -659,15 +915,39 @@ async def fetch_with_deep_interaction(url, captcha_api_key=None, proxy=None, deb
                 except Exception:
                     pass
 
-                # Wait for pagination selectors after scroll
+                # [FIX] Extra bottom-scroll pass for Etsy-style sites
+                # where pagination only appears after ALL products have loaded.
+                # After the main scroll, do a targeted scroll to the exact bottom
+                # and wait specifically for pagination elements.
                 pag_appeared = False
                 for sel in POST_SCROLL_WAIT_SELECTORS:
                     try:
                         await page.wait_for_selector(sel, timeout=3_000)
                         print(f"  [SCROLL] Pagination appeared: {sel}", file=sys.stderr)
-                        pag_appeared = True; break
+                        pag_appeared = True
+                        break
                     except Exception:
                         continue
+
+                # If no pagination found yet, do one more scroll-to-bottom attempt
+                if not pag_appeared:
+                    try:
+                        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                        await asyncio.sleep(2.0)
+                        try:
+                            await page.wait_for_load_state("networkidle", timeout=4_000)
+                        except Exception:
+                            pass
+                        for sel in POST_SCROLL_WAIT_SELECTORS:
+                            try:
+                                await page.wait_for_selector(sel, timeout=2_000)
+                                print(f"  [SCROLL2] Pagination appeared on retry: {sel}", file=sys.stderr)
+                                pag_appeared = True
+                                break
+                            except Exception:
+                                continue
+                    except Exception:
+                        pass
 
                 body = await page.content()
                 await browser.close()
@@ -678,13 +958,18 @@ async def fetch_with_deep_interaction(url, captcha_api_key=None, proxy=None, deb
                     qs = parse_qs(urlparse(best).query)
                     for pm in PAGINATION_PARAM_NAMES:
                         if pm in qs:
-                            api_pag = {"url": best, "pagination_key": pm}; break
+                            api_pag = {"url": best, "pagination_key": pm}
+                            break
 
                 return {
-                    "body": body, "fetch_method": "playwright_deep",
-                    "api_pagination": api_pag, "intercepted_urls": pag_reqs,
-                    "all_requests": all_reqs, "bypassed": not _is_still_blocked(body),
-                    "captcha_solved": captcha_solved, "pagination_appeared": pag_appeared,
+                    "body": body,
+                    "fetch_method": "playwright_deep",
+                    "api_pagination": api_pag,
+                    "intercepted_urls": pag_reqs,
+                    "all_requests": all_reqs,
+                    "bypassed": not _is_still_blocked(body),
+                    "captcha_solved": captcha_solved,
+                    "pagination_appeared": pag_appeared,
                 }
 
         except Exception as e:
@@ -709,7 +994,7 @@ def _build_api_result(url, api_info, fetch_method):
         "fetch_method": fetch_method, "pagination_found": True,
         "pagination_type": "api", "pagination_key": api_info.get("pagination_key"),
         "max_page": None,
-        "notes": f"Pagination via intercepted API: {api_info.get('url','')}",
+        "notes": f"Pagination via intercepted API: {api_info.get('url', '')}",
     }
 
 
@@ -739,20 +1024,20 @@ async def analyse_url(url, no_playwright=False, proxy=None,
         "max_page": None, "notes": "",
     }
 
-    # Step 1: requests
     rr = fetch_with_requests(url)
 
     if rr.get("error"):
         base["notes"] = f"requests error: {rr['error']}"
-        if no_playwright: return base
+        if no_playwright:
+            return base
         pw = await fetch_with_deep_interaction(url, captcha_api_key, proxy, debug)
         if pw.get("error"):
-            base["notes"] += f" | playwright error: {pw['error']}"; return base
+            base["notes"] += f" | playwright error: {pw['error']}"
+            return base
         if pw.get("api_pagination"):
             return _build_api_result(url, pw["api_pagination"], pw["fetch_method"])
         rr = {**rr, **pw, "needs_playwright": False, "blocked": False}
 
-    # Step 2: block -> deep bypass
     if rr.get("blocked"):
         bt = rr["block_type"]
         print(f"  [{bt}] Launching deep interaction bypass...", file=sys.stderr)
@@ -781,7 +1066,8 @@ async def analyse_url(url, no_playwright=False, proxy=None,
         fm = pw["fetch_method"]
         if pw.get("api_pagination"):
             r = _build_api_result(url, pw["api_pagination"], fm)
-            r["notes"] = "[deep bypass] " + r["notes"]; return r
+            r["notes"] = "[deep bypass] " + r["notes"]
+            return r
         if body:
             _write_debug(debug, url, body)
             soup = BeautifulSoup(body, "html.parser")
@@ -791,7 +1077,6 @@ async def analyse_url(url, no_playwright=False, proxy=None,
             base["notes"] = ("[deep bypass] " + base["notes"]).strip()
         return base
 
-    # Step 3: no block — JS rendering upgrade
     body = rr.get("body") or ""
     fm = rr.get("fetch_method", "requests")
 
@@ -804,7 +1089,6 @@ async def analyse_url(url, no_playwright=False, proxy=None,
                 return _build_api_result(url, pw["api_pagination"], fm)
             base["notes"] = "JS framework — deep interaction fetch used."
 
-    # Step 4: parse
     if body:
         _write_debug(debug, url, body)
         soup = BeautifulSoup(body, "html.parser")
@@ -812,7 +1096,6 @@ async def analyse_url(url, no_playwright=False, proxy=None,
         base.update(pag)
         base["fetch_method"] = fm
 
-        # Last resort: deep interaction if static found nothing
         if (not pag["pagination_found"] and fm == "requests"
                 and PLAYWRIGHT_AVAILABLE and not no_playwright):
             print("  Static found nothing — trying deep interaction...", file=sys.stderr)
@@ -837,15 +1120,19 @@ async def analyse_url(url, no_playwright=False, proxy=None,
 # ---------------------------------------------------------------------------
 
 async def main():
+    start_time = time.time()
+
     parser = argparse.ArgumentParser(
         description="Detect pagination on MRP URLs.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
     parser.add_argument("urls", nargs="*")
-    parser.add_argument("--file", "-f")
-    parser.add_argument("--output", "-o")
-    parser.add_argument("--pretty", action="store_true")
+    parser.add_argument("--file", "-f", default="urls.txt")
+    parser.add_argument("--output", "-o", default="output.json")
+    parser.add_argument("--stats", "-s", default="statistics.json",
+                        help="File to save execution statistics")
+    parser.add_argument("--pretty", action="store_true", default=True)
     parser.add_argument("--no-playwright", dest="no_playwright", action="store_true")
     parser.add_argument("--proxy", default=None,
                         help="e.g. http://user:pass@host:port")
@@ -856,11 +1143,15 @@ async def main():
     args = parser.parse_args()
 
     urls = list(args.urls)
-    if args.file:
+    if args.file and os.path.exists(args.file):
         with open(args.file, "r", encoding="utf-8") as fh:
             urls += [l.strip() for l in fh if l.strip() and not l.startswith("#")]
+    elif args.file and not os.path.exists(args.file) and args.file != "urls.txt":
+        # Only warn if the user explicitly provided a file that doesn't exist
+        print(f"  [!] Warning: File not found: {args.file}", file=sys.stderr)
     if not urls:
-        parser.print_help(); sys.exit(1)
+        parser.print_help()
+        sys.exit(1)
 
     captcha_key = args.captcha_key or os.environ.get("CAPTCHA_API_KEY")
     proxy = {"server": args.proxy} if args.proxy else None
@@ -868,22 +1159,51 @@ async def main():
     print(f"  curl_cffi (TLS) : {CURL_CFFI_AVAILABLE}", file=sys.stderr)
     print(f"  Playwright      : {PLAYWRIGHT_AVAILABLE}", file=sys.stderr)
     print(f"  Stealth         : {STEALTH_AVAILABLE}", file=sys.stderr)
-    print(f"  CAPTCHA solver  : {CAPTCHA_SOLVER_AVAILABLE} (key={'set' if captcha_key else 'not set'})",
-          file=sys.stderr)
+    print(f"  CAPTCHA solver  : {CAPTCHA_SOLVER_AVAILABLE} "
+          f"(key={'set' if captcha_key else 'not set'})", file=sys.stderr)
     if not CURL_CFFI_AVAILABLE:
-        print("  [!] pip install curl_cffi           — TLS fingerprint bypass", file=sys.stderr)
+        print("  [!] pip install curl_cffi", file=sys.stderr)
     if not STEALTH_AVAILABLE:
-        print("  [!] pip install playwright-stealth  — headless browser bypass", file=sys.stderr)
+        print("  [!] pip install playwright-stealth", file=sys.stderr)
     if not CAPTCHA_SOLVER_AVAILABLE:
-        print("  [!] pip install 2captcha-python     — CAPTCHA solving", file=sys.stderr)
+        print("  [!] pip install 2captcha-python", file=sys.stderr)
     print("", file=sys.stderr)
+
+    stats = {
+        "total_urls": len(urls),
+        "success": 0,
+        "blocked": 0,
+        "failed": 0,
+        "success_rate_percentage": 0.0,
+        "block_types": {},
+        "fetch_methods_used": {},
+        "pagination_types_found": {},
+        "duration_seconds": 0.0,
+    }
 
     results = []
     for url in urls:
         print(f"  Analysing: {url}", file=sys.stderr)
         result = await analyse_url(url, no_playwright=args.no_playwright,
-                                   proxy=proxy, captcha_api_key=captcha_key, debug=args.debug)
+                                   proxy=proxy, captcha_api_key=captcha_key,
+                                   debug=args.debug)
         results.append(result)
+
+        if result.get("pagination_found") and result.get("pagination_type") != "none":
+            stats["success"] += 1
+        elif result.get("block_detected"):
+            stats["blocked"] += 1
+            bt = result.get("block_type") or "unknown"
+            stats["block_types"][bt] = stats["block_types"].get(bt, 0) + 1
+        else:
+            stats["failed"] += 1
+
+        fm = result.get("fetch_method", "unknown")
+        stats["fetch_methods_used"][fm] = stats["fetch_methods_used"].get(fm, 0) + 1
+        if result.get("pagination_found"):
+            pt = result.get("pagination_type", "unknown")
+            stats["pagination_types_found"][pt] = stats["pagination_types_found"].get(pt, 0) + 1
+
         print(
             f"  -> type={result['pagination_type']} | key={result['pagination_key']} "
             f"| max={result['max_page']} | blocked={result['block_detected']} "
@@ -891,12 +1211,25 @@ async def main():
             file=sys.stderr,
         )
 
+    if stats["total_urls"] > 0:
+        stats["success_rate_percentage"] = round(
+            (stats["success"] / stats["total_urls"]) * 100, 2
+        )
+    stats["duration_seconds"] = round(time.time() - start_time, 2)
+
+    try:
+        with open(args.stats, "w", encoding="utf-8") as fs:
+            json.dump(stats, fs, indent=4)
+        print(f"\nStatistics written to {args.stats}", file=sys.stderr)
+    except Exception as e:
+        print(f"\nFailed to write statistics: {e}", file=sys.stderr)
+
     indent = 2 if args.pretty else None
     out = json.dumps(results if len(results) > 1 else results[0], indent=indent)
     if args.output:
         with open(args.output, "w", encoding="utf-8") as fh:
             fh.write(out)
-        print(f"\nResults written to {args.output}", file=sys.stderr)
+        print(f"Results written to {args.output}", file=sys.stderr)
     else:
         print(out)
 
